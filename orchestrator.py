@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -128,27 +129,54 @@ def invoke_setter() -> dict | None:
 
 # --- Solver ---------------------------------------------------------------
 
-def invoke_solver(ciphertext: str) -> str | None:
-    """Run the solver against `ciphertext`. Returns the guess, or None on failure."""
-    # Always start from a clean slate so a stale answer.txt can't leak through.
-    ANSWER.unlink(missing_ok=True)
-    CURRENT_QUIZ.write_text(ciphertext)
+def invoke_solver(ciphertext: str, round_num: int, enable_monitoring: bool = False) -> str | None:
+    """Run the solver against `ciphertext` in an isolated workspace."""
+    # Create isolated workspace for this round
+    workspace = ROOT / "solver_workspaces" / f"round_{round_num}"
+    workspace.mkdir(parents=True, exist_ok=True)
+    
+    # Copy only what the solver needs - no access to ledger
+    shutil.copy(SOLVER_DIR / "CLAUDE.md", workspace / "CLAUDE.md")
+    (workspace / "current_quiz.txt").write_text(ciphertext)
+    
+    # Clean any previous answer
+    answer_file = workspace / "answer.txt"
+    answer_file.unlink(missing_ok=True)
 
-    rc, _out, err = run_agent(
-        SOLVER_DIR,
-        "Solve the quiz per CLAUDE.md and exit.",
-        SOLVER_TOOLS,
-    )
+    if enable_monitoring:
+        try:
+            from monitoring import run_solver_monitored
+            rc, _out, err, monitoring_report = run_solver_monitored(
+                workspace, 
+                "Solve the cipher puzzle per CLAUDE.md and exit.",
+                SOLVER_TOOLS,
+                AGENT_TIMEOUT_SECONDS
+            )
+            
+            # Save monitoring report
+            report_file = workspace / "monitoring_report.json"
+            report_file.write_text(json.dumps(monitoring_report, indent=2))
+            
+            # Alert on suspicious activity
+            if monitoring_report["file_access"].get("severity_counts", {}).get("HIGH", 0) > 0:
+                print(f"[MONITOR] WARNING: High-risk file access detected in round {round_num}")
+                
+        except ImportError:
+            print(f"[MONITOR] monitoring.py not found, falling back to normal execution")
+            rc, _out, err = run_agent(workspace, "Solve the cipher puzzle per CLAUDE.md and exit.", SOLVER_TOOLS)
+    else:
+        rc, _out, err = run_agent(workspace, "Solve the cipher puzzle per CLAUDE.md and exit.", SOLVER_TOOLS)
+
     if rc != 0:
         print(f"[solver] non-zero exit ({rc}): {err.strip()}", file=sys.stderr)
         if _out.strip():
             print(f"[solver] stdout: {_out.strip()}", file=sys.stderr)
         return None
-    if not ANSWER.exists():
+    if not answer_file.exists():
         print("[solver] did not produce answer.txt", file=sys.stderr)
         return None
 
-    return ANSWER.read_text().strip()
+    return answer_file.read_text().strip()
 
 
 # --- Grading --------------------------------------------------------------
@@ -161,7 +189,7 @@ def is_correct(guess: str | None, plaintext: str) -> bool:
 
 # --- Round loop -----------------------------------------------------------
 
-def run_round(round_num: int, solver_name: str, max_attempts: int) -> None:
+def run_round(round_num: int, solver_name: str, max_attempts: int, enable_monitoring: bool = False) -> None:
     print(f"\n=== Round {round_num} ===")
 
     quiz = invoke_setter()
@@ -193,7 +221,7 @@ def run_round(round_num: int, solver_name: str, max_attempts: int) -> None:
 
     solved = False
     for attempt_num in range(1, max_attempts + 1):
-        guess = invoke_solver(entry["ciphertext"])
+        guess = invoke_solver(entry["ciphertext"], round_num, enable_monitoring)
         correct = is_correct(guess, entry["plaintext"])
 
         ledger = load_ledger()
@@ -225,10 +253,11 @@ def run_round(round_num: int, solver_name: str, max_attempts: int) -> None:
             f"answer was {entry['plaintext']!r}"
         )
 
-    # Round cleanup. Leaving stale handoff files around invites bugs where
-    # the next solver invocation reads an old ciphertext.
-    CURRENT_QUIZ.unlink(missing_ok=True)
-    ANSWER.unlink(missing_ok=True)
+    # Round cleanup. Remove the isolated workspace to prevent data leakage
+    # between rounds and keep disk usage bounded.
+    workspace = ROOT / "solver_workspaces" / f"round_{round_num}"
+    if workspace.exists():
+        shutil.rmtree(workspace)
 
 
 # --- Entry point ----------------------------------------------------------
@@ -257,6 +286,8 @@ def main() -> int:
                         help="name stamped on each attempt in the ledger")
     parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS,
                         help=f"solver attempts per quiz (default: {DEFAULT_MAX_ATTEMPTS})")
+    parser.add_argument("--enable-monitoring", action="store_true",
+                        help="enable file access monitoring and cheating detection")
     args = parser.parse_args()
 
     if not LEDGER.exists() or not LEDGER.read_text().strip():
@@ -265,7 +296,7 @@ def main() -> int:
     rounds_run = 0
     try:
         for i in range(1, args.rounds + 1):
-            run_round(i, args.solver_name, args.max_attempts)
+            run_round(i, args.solver_name, args.max_attempts, args.enable_monitoring)
             rounds_run += 1
     except KeyboardInterrupt:
         print("\n[orchestrator] interrupted", file=sys.stderr)
@@ -276,8 +307,10 @@ def main() -> int:
             ledger["quiz"][-1]["status"] = "interrupted"
             ledger["quiz"][-1]["closed_at"] = now_iso()
             save_ledger(ledger)
-        CURRENT_QUIZ.unlink(missing_ok=True)
-        ANSWER.unlink(missing_ok=True)
+        # Clean up workspace directories and handoff files
+        workspace_root = ROOT / "solver_workspaces"
+        if workspace_root.exists():
+            shutil.rmtree(workspace_root)
         NEW_QUIZ.unlink(missing_ok=True)
         return 130
 
